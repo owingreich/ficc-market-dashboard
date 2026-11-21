@@ -111,62 +111,131 @@ def classify_curve_move(curve: pd.DataFrame, min_move_bp: float) -> pd.DataFrame
     return out
 
 
-def backtest_spread_reversion(spread: pd.Series, lookback: int = 60,
-                               entry_z: float = 1.5, holding: int = 5,
-                               cost_bp: float = 0.0) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Non-overlapping spread mean-reversion signal study, using observed sessions.
-
-    At the close of observation t, signal uses spread[t] and the prior `lookback`
-    observations only (rolling mean/std shifted by one observation). We assume
-    entry at the observed spread at t and exit at t+holding. This is an IDEALIZED
-    close-to-close scenario, not a fillable execution model; there may be a delay
-    between FRED observation availability and actual execution.
-    """
+def research_signals(spread: pd.Series, lookback: int, threshold: float) -> pd.DataFrame:
+    """Signals are decided from observation t and prior lookback observations."""
     x = spread.dropna().sort_index().astype(float)
     history = x.shift(1)
-    mean = history.rolling(lookback, min_periods=lookback).mean()
-    std = history.rolling(lookback, min_periods=lookback).std(ddof=1)
-    z = ((x - mean) / std.where(std > 1e-12)).replace([float('inf'), -float('inf')], float('nan'))
-    observations = pd.DataFrame({"spread_bp": x, "reference_mean_bp": mean,
-                                 "reference_std_bp": std, "z_score": z})
+    prior_mean = history.rolling(lookback, min_periods=lookback).mean()
+    prior_std = history.rolling(lookback, min_periods=lookback).std(ddof=1)
+    z = ((x - prior_mean) / prior_std.where(prior_std > 1e-12)).replace(
+        [float("inf"), -float("inf")], float("nan"))
+    observations = pd.DataFrame({"spread_bp": x, "reference_mean_bp": prior_mean,
+                                 "z_score": z})
     observations["signal"] = 0
-    observations.loc[observations["z_score"] >= entry_z, "signal"] = -1  # short spread
-    observations.loc[observations["z_score"] <= -entry_z, "signal"] = 1   # long spread
-    observations["signal_label"] = observations["signal"].map(
-        {-1: "Short spread", 0: "No trade", 1: "Long spread"})
+    observations.loc[z >= threshold, "signal"] = -1
+    observations.loc[z <= -threshold, "signal"] = 1
+    return observations
 
-    # One position at a time. Entries at next possible decision occur strictly
-    # after prior exit, so neither holding periods nor observations overlap.
+
+def research_backtest(spread: pd.Series, lookback: int = 60, threshold: float = 1.5,
+                      holding: int = 5, cost_bp: float = 1.0,
+                      mode: str = "Mean reversion") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Non-overlapping signal study: observation t -> entry t+1 -> exit t+1+holding.
+
+    Results are signed yield-spread changes, not bond cash P&L. The model is
+    still hypothetical: t+1 FRED observations are not necessarily executable.
+    """
+    obs = research_signals(spread, lookback, threshold)
     trades = []
     i = lookback
-    while i < len(observations) - holding:
-        row = observations.iloc[i]
-        direction = int(row["signal"])
-        if direction == 0:
+    # Entry and exit must exist; the final incomplete position is dropped.
+    while i + 1 + holding < len(obs):
+        signal = int(obs.iloc[i]["signal"])
+        if signal == 0:
             i += 1
             continue
-        exit_i = i + holding
-        exit_row = observations.iloc[exit_i]
-        spread_change = float(exit_row["spread_bp"] - row["spread_bp"])
-        gross = direction * spread_change
-        net = gross - cost_bp
+        direction = signal if mode == "Mean reversion" else -signal
+        entry_i, exit_i = i + 1, i + 1 + holding
+        entry = float(obs.iloc[entry_i]["spread_bp"])
+        exit_spread = float(obs.iloc[exit_i]["spread_bp"])
+        change = exit_spread - entry
+        gross = direction * change
         trades.append({
-            "entry_date": observations.index[i].date().isoformat(),
-            "exit_date": observations.index[exit_i].date().isoformat(),
+            "signal_date": obs.index[i].date().isoformat(),
+            "entry_date": obs.index[entry_i].date().isoformat(),
+            "exit_date": obs.index[exit_i].date().isoformat(),
             "position": "Long spread" if direction > 0 else "Short spread",
-            "entry_spread_bp": round(float(row["spread_bp"]), 4),
-            "entry_z_score": round(float(row["z_score"]), 4),
-            "exit_spread_bp": round(float(exit_row["spread_bp"]), 4),
-            "spread_change_bp": round(spread_change, 4),
+            "entry_spread_bp": round(entry, 4),
+            "signal_z_score": round(float(obs.iloc[i]["z_score"]), 4),
+            "exit_spread_bp": round(exit_spread, 4),
+            "spread_change_bp": round(change, 4),
             "gross_proxy_bp": round(gross, 4),
             "assumed_cost_bp": round(cost_bp, 4),
-            "net_proxy_bp": round(net, 4),
+            "net_proxy_bp": round(gross - cost_bp, 4),
         })
+        # Next signal is after the completed exit (no overlapping positions).
         i = exit_i + 1
-    trades_df = pd.DataFrame(trades)
-    if not trades_df.empty:
-        trades_df["cumulative_net_proxy_bp"] = trades_df["net_proxy_bp"].cumsum()
-    return observations, trades_df
+    cols = ["signal_date", "entry_date", "exit_date", "position", "entry_spread_bp",
+            "signal_z_score", "exit_spread_bp", "spread_change_bp", "gross_proxy_bp",
+            "assumed_cost_bp", "net_proxy_bp"]
+    result = pd.DataFrame(trades, columns=cols)
+    if not result.empty:
+        result["cumulative_net_proxy_bp"] = result["net_proxy_bp"].cumsum()
+    return obs, result
+
+
+def split_trades(trades: pd.DataFrame, cutoff: pd.Timestamp) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Training requires completed exit before test starts; test needs entry on/after cutoff.
+
+    Positions crossing the boundary are excluded from both groups. Training
+    decisions cannot incorporate prices or outcomes within the holdout.
+    """
+    exit_dates = pd.to_datetime(trades["exit_date"])
+    entry_dates = pd.to_datetime(trades["entry_date"])
+    return trades.loc[exit_dates < cutoff].copy(), trades.loc[entry_dates >= cutoff].copy()
+
+
+def risk_summary(trades: pd.DataFrame) -> dict:
+    if trades.empty:
+        return {"Trades": 0, "Win rate (%)": float("nan"), "Mean net (bp)": float("nan"),
+                "Total net (bp)": 0.0, "Max drawdown (bp)": float("nan"),
+                "Profit factor": float("nan"), "Avg win (bp)": float("nan"),
+                "Avg loss (bp)": float("nan")}
+    r = trades["net_proxy_bp"].astype(float)
+    equity = pd.concat([pd.Series([0.0]), r.cumsum().reset_index(drop=True)], ignore_index=True)
+    drawdown = equity - equity.cummax()
+    wins = r[r > 0]
+    losses = r[r < 0]
+    gross_profit = float(wins.sum())
+    gross_loss = float(-losses.sum())
+    return {"Trades": int(len(r)), "Win rate (%)": round(float((r > 0).mean() * 100), 2),
+            "Mean net (bp)": round(float(r.mean()), 3),
+            "Total net (bp)": round(float(r.sum()), 3),
+            "Max drawdown (bp)": round(float(drawdown.min()), 3),
+            "Profit factor": round(gross_profit / gross_loss, 3) if gross_loss > 0 else float("nan"),
+            "Avg win (bp)": round(float(wins.mean()), 3) if len(wins) else float("nan"),
+            "Avg loss (bp)": round(float(losses.mean()), 3) if len(losses) else float("nan")}
+
+
+def train_parameter_search(spread: pd.Series, cutoff: pd.Timestamp, cost_bp: float,
+                           holding_values=(3, 5, 10), thresholds=(1.0, 1.5, 2.0),
+                           lookbacks=(40, 60, 100), min_trades=10) -> pd.DataFrame:
+    """Search mean-reversion rules solely on pre-cutoff completed trades."""
+    results = []
+    for lb in lookbacks:
+        for th in thresholds:
+            for hold in holding_values:
+                _, ledger = research_backtest(spread, lb, th, hold, cost_bp, "Mean reversion")
+                train, _ = split_trades(ledger, cutoff)
+                if len(train) < min_trades:
+                    continue
+                r = risk_summary(train)
+                results.append({"Lookback": lb, "Threshold": th, "Holding": hold,
+                                "Training trades": r["Trades"],
+                                "Train mean net (bp)": r["Mean net (bp)"],
+                                "Train total net (bp)": r["Total net (bp)"]})
+    if not results:
+        return pd.DataFrame(columns=["Lookback", "Threshold", "Holding", "Training trades",
+                                     "Train mean net (bp)", "Train total net (bp)"])
+    return pd.DataFrame(results).sort_values(
+        ["Train mean net (bp)", "Training trades", "Lookback", "Threshold", "Holding"],
+        ascending=[False, False, True, True, True]).reset_index(drop=True)
+
+
+def segment_table(ledger: pd.DataFrame, cutoff: pd.Timestamp, strategy: str) -> list[dict]:
+    train, test = split_trades(ledger, cutoff)
+    return [{"Strategy": strategy, "Sample": label, **risk_summary(part)}
+            for label, part in [("Training", train), ("Holdout", test)]]
 
 
 def api_key():
@@ -481,130 +550,214 @@ with curve_tab:
 
 
 with backtest_tab:
-    st.subheader("Strategy research: 2s10s spread mean reversion")
-    st.write("Hypothesis: unusually wide 2s10s spreads tend to narrow, and unusually "
-             "narrow spreads tend to widen, over the following trading sessions.")
-    st.caption("Research-only signal study. Results are an idealized spread-change proxy "
-               "in bp, NOT actual tradable bond or futures P&L.")
+    st.subheader("Strategy research: 2s10s yield-spread hypotheses")
+    st.caption("Final research version: next-observation entry, non-overlapping positions, "
+               "chronological training/holdout split and risk diagnostics. All outputs "
+               "are spread-change proxies in bp, NOT instrument returns or cash P&L.")
 
     col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
-        lookback = st.slider("Prior observations", 20, 120, 60, step=10,
-                             help="Rolling mean/std use only sessions preceding the signal date.")
+        lookback = st.slider("Prior observations", 20, 120, 60, step=10)
     with col_b:
-        threshold = st.slider("Entry z-score (absolute)", 0.5, 3.0, 1.5, step=0.25,
-                              help="At least this many prior-window standard deviations from its mean.")
+        threshold = st.slider("Entry z-score (absolute)", 0.5, 3.0, 1.5, step=0.25)
     with col_c:
-        holding = st.slider("Holding period (sessions)", 1, 20, 5,
-                            help="Exit after this many paired Treasury observation sessions.")
+        holding = st.slider("Holding period after entry (sessions)", 1, 20, 5)
     with col_d:
-        cost = st.number_input("Hypothetical round-trip cost (bp)", min_value=0.0,
-                               max_value=10.0, value=0.0, step=0.5,
-                               help="A sensitivity assumption in spread-proxy bp, not observed transaction costs.")
+        cost = st.number_input("Assumed round-trip cost (proxy bp)", 0.0, 10.0, 1.0, step=0.5)
 
-    spread = df[["US 2Y Treasury Yield", "US 10Y Treasury Yield"]].dropna()
-    spread = (spread["US 10Y Treasury Yield"] - spread["US 2Y Treasury Yield"]) * 100
-    spread.name = "2s10s spread (bp)"
-    if len(spread) < lookback + holding + 2:
-        st.warning("Insufficient paired Treasury observations. Widen the sidebar date range "
-                   "or reduce the lookback and holding period.")
+    spread_data = df[["US 2Y Treasury Yield", "US 10Y Treasury Yield"]].dropna()
+    spread = ((spread_data["US 10Y Treasury Yield"] - spread_data["US 2Y Treasury Yield"]) * 100)
+    spread.name = "2s10s Spread (bp)"
+    if len(spread) < max(lookback + holding + 3, 120):
+        st.warning("Insufficient paired observations. Choose a longer sidebar date range. "
+                   "For a meaningful holdout, use January 2018 to present.")
     else:
-        observations, trades = backtest_spread_reversion(spread, lookback, threshold, holding, cost)
-        signal_count = int((observations["signal"] != 0).sum())
-        st.caption(f"{len(spread):,} paired Treasury observations | {signal_count} raw threshold "
-                   "crossings (before excluding overlapping positions) | "
-                   "one position at a time")
+        st.markdown("**Evaluation design**")
+        st.caption("The split is based on observation dates. Training trades must exit before "
+                   "the cutoff; holdout trades must enter on/after the cutoff. "
+                   "Cross-boundary trades are excluded from both samples.")
+        cutoff_index = st.slider("Training share of observations (%)", 50, 85, 70, step=5)
+        cutoff = spread.index[int(len(spread) * cutoff_index / 100)]
+        st.write(f"Training ends before **{cutoff.date()}**; holdout begins **{cutoff.date()}**. "
+                 "Past observations may be used to warm up rolling indicators in the holdout.")
+        mode = st.radio("Parameter selection", ["Manual settings", "Select on training data"],
+                        horizontal=True, help="Training-data selection maximises average net "
+                        "spread proxy across a small predefined parameter grid; it can overfit.")
+        search = pd.DataFrame()
+        if mode == "Select on training data":
+            with st.spinner("Evaluating the predefined parameter grid on training trades..."):
+                search = train_parameter_search(spread, cutoff, cost)
+            if search.empty:
+                st.warning("Not enough completed training trades for robust parameter selection. "
+                           "Choose a longer time range or use manual settings.")
+                active_lb, active_th, active_h = lookback, threshold, holding
+            else:
+                best = search.iloc[0]
+                active_lb, active_th, active_h = int(best["Lookback"]), float(best["Threshold"]), int(best["Holding"])
+                st.info(f"Training-selected rule: {active_lb}-observation lookback, "
+                        f"z={active_th:.2f}, {active_h}-session hold. "
+                        "Selection maximises training mean net proxy across 27 candidates. "
+                        "The holdout is for one-time evaluation, not further tuning.")
+                with st.expander("Training-only parameter search results"):
+                    st.dataframe(search, hide_index=True, use_container_width=True)
+                    st.download_button("Download training grid (CSV)", search.to_csv(index=False),
+                                       "ficc_training_grid.csv", mime="text/csv")
+        else:
+            active_lb, active_th, active_h = lookback, threshold, holding
+
+        mean_obs, mean_ledger = research_backtest(spread, active_lb, active_th, active_h,
+                                                  cost, "Mean reversion")
+        _, mom_ledger = research_backtest(spread, active_lb, active_th, active_h,
+                                          cost, "Momentum")
+        mean_train, mean_test = split_trades(mean_ledger, cutoff)
+        mom_train, mom_test = split_trades(mom_ledger, cutoff)
+        st.caption(f"{len(spread):,} paired observations | "
+                   f"{int((mean_obs['signal'] != 0).sum()):,} raw signals | "
+                   "signals at t, hypothetical entry at t+1, exit after selected hold")
 
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=observations.index, y=observations["spread_bp"],
-                                 name="2s10s spread", mode="lines"))
-        fig.add_trace(go.Scatter(x=observations.index, y=observations["reference_mean_bp"],
-                                 name="Prior-window mean", mode="lines", line=dict(dash="dash")))
-        if not trades.empty:
-            entry_index = pd.to_datetime(trades["entry_date"])
-            longs = trades["position"] == "Long spread"
-            for mask, label, symbol in [
-                (longs, "Long spread entries", "triangle-up"),
-                (~longs, "Short spread entries", "triangle-down"),
-            ]:
+        fig.add_trace(go.Scatter(x=mean_obs.index, y=mean_obs["spread_bp"],
+                                 mode="lines", name="2s10s spread"))
+        fig.add_trace(go.Scatter(x=mean_obs.index, y=mean_obs["reference_mean_bp"],
+                                 mode="lines", name="Prior-window mean", line=dict(dash="dash")))
+        fig.add_vline(x=cutoff.timestamp() * 1000, line_dash="dash", line_color="gray")
+        if not mean_ledger.empty:
+            entry_index = pd.to_datetime(mean_ledger["entry_date"])
+            for label, marker in [("Long spread", "triangle-up"), ("Short spread", "triangle-down")]:
+                mask = mean_ledger["position"] == label
                 if mask.any():
-                    dates = entry_index[mask]
-                    fig.add_trace(go.Scatter(x=dates, y=observations.loc[dates, "spread_bp"],
-                                             mode="markers", name=label,
-                                             marker=dict(size=10, symbol=symbol)))
-        fig.update_layout(title="Spread and historical entry signals", height=420,
-                          yaxis_title="basis points", hovermode="x unified",
-                          margin=dict(l=15, r=15, t=55, b=15))
+                    dates = entry_index.loc[mask]
+                    fig.add_trace(go.Scatter(x=dates, y=mean_obs.loc[dates, "spread_bp"],
+                                             mode="markers", name=label + " entries",
+                                             marker=dict(size=8, symbol=marker)))
+        fig.update_layout(title="Historical 2s10s spread and mean-reversion entries | cutoff marked",
+                          yaxis_title="basis points", height=410,
+                          margin=dict(l=15, r=15, t=60, b=15))
         st.plotly_chart(fig, use_container_width=True)
 
-        if trades.empty:
-            st.info("No completed non-overlapping trades under these settings. Try a longer "
-                    "historical period or a lower entry threshold. A zero-trade result is valid.")
+        st.markdown("**Chronological performance comparison**")
+        comparison = pd.DataFrame(segment_table(mean_ledger, cutoff, "Mean reversion") +
+                                  segment_table(mom_ledger, cutoff, "Momentum"))
+        st.dataframe(comparison, hide_index=True, use_container_width=True)
+        st.caption("Momentum uses the same signal dates, holding periods and hypothetical "
+                   "costs, but takes the opposite spread direction. No-trade baseline = "
+                   "zero gross and net spread proxy with zero risk/exposure. "
+                   "It is shown conceptually, not as a tradable benchmark.")
+
+        st.markdown("**Holdout assessment (preselected parameters)**")
+        if mean_test.empty:
+            st.warning("No completed holdout trades for these parameters. This is not evidence "
+                       "of profitability. Choose a longer data window.")
         else:
-            wins = float((trades["net_proxy_bp"] > 0).mean() * 100)
-            avg = float(trades["net_proxy_bp"].mean())
-            cumulative = float(trades["net_proxy_bp"].sum())
-            worst = float(trades["net_proxy_bp"].min())
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Completed trades", str(len(trades)))
-            m2.metric("Net positive-trade rate", f"{wins:.1f}%")
-            m3.metric("Mean net proxy / trade", f"{avg:+.2f} bp")
-            m4.metric("Total net proxy", f"{cumulative:+.2f} bp")
-            st.caption(f"Worst single-trade net proxy: {worst:+.2f} bp. "
-                       "A positive-trade rate above 50% alone does not demonstrate statistical "
-                       "significance or implementable profitability.")
+            r = risk_summary(mean_test)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Holdout completed trades", f"{r['Trades']}")
+            k2.metric("Holdout positive-trade rate", f"{r['Win rate (%)']:.1f}%")
+            k3.metric("Holdout mean proxy / trade", f"{r['Mean net (bp)']:+.2f} bp")
+            k4.metric("Holdout total net proxy", f"{r['Total net (bp)']:+.2f} bp")
             fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=pd.to_datetime(trades["exit_date"]),
-                                      y=trades["cumulative_net_proxy_bp"],
-                                      mode="lines+markers", name="Cumulative trade proxy"))
+            for ledger, name in [(mean_test, "Mean reversion"), (mom_test, "Momentum")]:
+                if not ledger.empty:
+                    fig2.add_trace(go.Scatter(x=pd.to_datetime(ledger["exit_date"]),
+                                              y=ledger["net_proxy_bp"].cumsum(),
+                                              mode="lines+markers", name=name))
             fig2.add_hline(y=0, line_dash="dot", line_color="gray")
-            fig2.update_layout(title="Cumulative signed spread-change proxy (completed trades only)",
-                               yaxis_title="cumulative proxy bp", height=360,
+            fig2.update_layout(title="Cumulative holdout spread-change proxy | completed trades only",
+                               height=340, yaxis_title="cumulative proxy bp",
                                margin=dict(l=15, r=15, t=55, b=15))
             st.plotly_chart(fig2, use_container_width=True)
-            st.subheader("Trade ledger")
-            st.dataframe(trades.sort_values("entry_date", ascending=False),
-                         use_container_width=True, hide_index=True)
-            st.download_button("Download research trade ledger (CSV)",
-                               trades.to_csv(index=False),
-                               "ficc_curve_reversion_research.csv", mime="text/csv")
-            midpoint = len(trades) // 2
-            if len(trades) >= 8:
-                earlier = trades.iloc[:midpoint]
-                later = trades.iloc[midpoint:]
-                st.markdown("**Chronological split (descriptive robustness check)**")
-                summary = pd.DataFrame([
-                    {"Sample": name, "Trades": len(part),
-                     "Mean net proxy (bp)": round(float(part["net_proxy_bp"].mean()), 2),
-                     "Positive trade rate (%)": round(float((part["net_proxy_bp"] > 0).mean() * 100), 1)}
-                    for name, part in [("Earlier half", earlier), ("Later half", later)]
-                ])
-                st.dataframe(summary, hide_index=True, use_container_width=True)
-                st.caption("This split does not create a true untouched out-of-sample test if "
-                           "you repeatedly adjust parameters while viewing the later sample.")
 
-        with st.expander("Research methodology and limitations", expanded=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Holdout trade outcomes**")
+            if not mean_test.empty:
+                fig3 = go.Figure(go.Histogram(x=mean_test["net_proxy_bp"], nbinsx=20,
+                                               name="Mean reversion"))
+                fig3.update_layout(xaxis_title="net spread proxy (bp)",
+                                   yaxis_title="completed trades", height=320)
+                st.plotly_chart(fig3, use_container_width=True)
+            else:
+                st.info("No completed holdout trades.")
+        with c2:
+            st.markdown("**Mean-reversion performance by exit year**")
+            if not mean_ledger.empty:
+                yearly = mean_ledger.copy()
+                yearly["Year"] = pd.to_datetime(yearly["exit_date"]).dt.year
+                annual = yearly.groupby("Year", as_index=False).agg(
+                    Trades=("net_proxy_bp", "size"),
+                    **{"Total net proxy (bp)": ("net_proxy_bp", "sum"),
+                       "Mean net proxy (bp)": ("net_proxy_bp", "mean")})
+                st.dataframe(annual.round(2), hide_index=True, use_container_width=True)
+
+        st.markdown("**Training-only parameter sensitivity**")
+        st.caption("Fixed holding period, varied lookback and z-score threshold. "
+                   "Cell values are mean net spread proxies on completed training trades; "
+                   "blank cells have fewer than 5 training trades. Do not use holdout "
+                   "outcomes to choose an alternative configuration.")
+        sensitivity = []
+        for lb in [40, 60, 100]:
+            for th in [1.0, 1.5, 2.0]:
+                _, grid_ledger = research_backtest(spread, lb, th, active_h, cost)
+                tr, _ = split_trades(grid_ledger, cutoff)
+                sensitivity.append({"Lookback": lb, "Threshold": th,
+                                    "Train mean net (bp)": float(tr["net_proxy_bp"].mean())
+                                    if len(tr) >= 5 else float("nan")})
+        sens = pd.DataFrame(sensitivity).pivot(index="Lookback", columns="Threshold",
+                                                values="Train mean net (bp)")
+        heat = go.Figure(go.Heatmap(z=sens.to_numpy(), x=[str(x) for x in sens.columns],
+                                   y=[str(y) for y in sens.index],
+                                   colorscale="RdBu", zmid=0, text=sens.round(2).to_numpy(),
+                                   texttemplate="%{text}", hoverongaps=False))
+        heat.update_layout(xaxis_title="Entry z-score", yaxis_title="Lookback observations",
+                           height=280, margin=dict(l=20, r=20, t=20, b=30))
+        st.plotly_chart(heat, use_container_width=True)
+
+        with st.expander("Trade ledger and export", expanded=False):
+            sample = st.selectbox("Trade ledger sample", ["Holdout", "Training", "All research trades"])
+            selected_ledger = {"Holdout": mean_test, "Training": mean_train,
+                               "All research trades": mean_ledger}[sample]
+            st.dataframe(selected_ledger.sort_values("entry_date", ascending=False),
+                         hide_index=True, use_container_width=True)
+            st.download_button("Download selected trade ledger (CSV)",
+                               selected_ledger.to_csv(index=False),
+                               "ficc_v5_research_ledger.csv", mime="text/csv")
+            st.download_button("Download comparison (CSV)", comparison.to_csv(index=False),
+                               "ficc_v5_comparison.csv", mime="text/csv")
+
+        with st.expander("Methodology, limitations and interview interpretation", expanded=True):
             st.markdown("""
-            **Signal timing:** At each completed Treasury observation session *t*, compute a
-            z-score using the **previous** `lookback` paired observations only. If the current
-            spread is above the prior mean by at least the z threshold, enter a hypothetical
-            **short-spread** position; below the mean, enter a hypothetical **long-spread** position.
+            **Research question:** Do extreme 2s10s yield-spread deviations predict
+            subsequent mean reversion? The matched momentum comparator instead assumes
+            continuation. Z-score reference moments use **only prior observations**.
 
-            **Exit and scoring:** Hold for the selected number of subsequent paired observation
-            sessions. Long-spread proxy = exit spread minus entry spread; short-spread proxy
-            = entry spread minus exit spread. Subtract the optional, hypothetical round-trip
-            cost once per completed trade. Exit sessions are excluded from immediate re-entry;
-            positions never overlap. The final incomplete holding period is omitted.
+            **Timing:** A signal is determined from FRED observation *t*. The idealised
+            spread entry is the next paired observation at *t+1*, with an exit after
+            the selected holding period. Positions never overlap. This reduces the
+            original same-observation entry bias, but **does not guarantee executable
+            prices**: FRED observations may be released with a lag, and entry at a
+            future published observation is still an idealisation.
 
-            **What this does *not* establish:** FRED observations may be published after the
-            relevant market close, so assumed entry at the observed value may be unavailable
-            in live trading. Spread bp are **not** price returns, cash P&L, or a DV01-neutral
-            replication. Actual curve trades require instrument-level prices, durations,
-            financing, execution assumptions, slippage, and transaction costs. Repeated
-            parameter selection can overfit historical data. The sample excludes data
-            before the sidebar start date, and no significance test is performed.
+            **Holdout design:** The chronological cutoff is fixed by observation
+            count. Training trades must finish before the cutoff; holdout trades
+            must start on/after it. The 27-candidate search maximises training
+            mean net proxy with at least 10 completed training trades. Choosing
+            parameters after looking at holdout results invalidates an untouched
+            holdout interpretation. An exploratory holdout is not external validation.
+
+            **Risk statistics:** Drawdown is the peak-to-trough change in cumulative
+            realised **proxy bp**, starting from zero. Profit factor equals the sum
+            of positive net proxies divided by the absolute sum of negative ones.
+            These are not portfolio-return risk metrics.
+
+            **Trading realism:** Treasury 2s10s spread points are not dollars,
+            bond price returns, or DV01-neutral P&L. This prototype does not price
+            underlying instruments, calculate hedge ratios, funding, slippage, or
+            actual execution costs. The user-entered cost is a sensitivity
+            assumption denominated in *spread-proxy* bp, not market evidence.
+            FRED dates, differing market close times and potential revisions limit
+            interpretations. Neither a positive backtest nor this dashboard
+            establishes a reliable tradable edge.
             """)
-
 
 with data_tab:
     st.subheader("Latest observations and downloadable data")
