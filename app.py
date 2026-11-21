@@ -15,6 +15,71 @@ SERIES = {
 }
 
 
+
+# Announcement dates are meeting end dates from the Federal Reserve calendar.
+# Unscheduled meetings and notation votes are intentionally excluded.
+FOMC_DATES = [
+    "2023-02-01", "2023-03-22", "2023-05-03", "2023-06-14",
+    "2023-07-26", "2023-09-20", "2023-11-01", "2023-12-13",
+    "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12",
+    "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
+    "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
+    "2025-07-30", "2025-09-17", "2025-10-29", "2025-12-10",
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28",
+]
+
+FOMC_CALENDAR_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+
+
+def event_reaction(series: pd.Series, event: pd.Timestamp, multiplier: float, horizons=(0, 1, 5)):
+    """Compare an event-day observation and subsequent valid observations with the prior one.
+
+    Horizon 0 = event-date observation; +1 = next available observation after it;
+    +5 = fifth available observation after it. No gaps are forward-filled.
+    Returns rows with actual dates, so data lag is visible.
+    """
+    s = series.dropna().sort_index()
+    before = s.loc[s.index < event]
+    event_obs = s.loc[s.index == event]
+    if before.empty or event_obs.empty:
+        return None, "No valid observation on the announcement date or preceding it."
+    baseline_date = before.index[-1]
+    baseline = float(before.iloc[-1])
+    after = s.loc[s.index >= event]
+    if len(after) <= max(horizons):
+        return None, "Not enough observations after the announcement for the selected horizons."
+    result = []
+    for horizon in horizons:
+        date_at = after.index[horizon]
+        value = float(after.iloc[horizon])
+        change = (value - baseline) * multiplier if multiplier else ((value / baseline) - 1) * 100
+        result.append({"Horizon": "Event day" if horizon == 0 else f"+{horizon} sessions",
+                       "Observation date": date_at.date().isoformat(), "Change": change})
+    return {"baseline_date": baseline_date, "baseline_value": baseline, "rows": result}, None
+
+
+def event_chart(series: pd.Series, event: pd.Timestamp, title: str, multiplier: float, units: str):
+    """Plot value changes relative to the last valid observation before the meeting."""
+    valid = series.dropna().sort_index()
+    prior = valid.loc[valid.index < event]
+    on_day = valid.loc[valid.index == event]
+    if prior.empty or on_day.empty:
+        st.warning(f"{title}: missing baseline or event-date observation.")
+        return
+    baseline_date, baseline = prior.index[-1], float(prior.iloc[-1])
+    left = valid.loc[(valid.index >= event - pd.Timedelta(days=14)) & (valid.index <= event + pd.Timedelta(days=14))]
+    left = pd.concat([valid.loc[[baseline_date]], left]).sort_index()
+    changes = (left - baseline) * multiplier if multiplier else (left / baseline - 1) * 100
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=changes.index, y=changes.values, mode="lines+markers", name=title))
+    fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    fig.add_vline(x=event.timestamp() * 1000, line_dash="dash", line_color="gray")
+    fig.update_layout(title=title, yaxis_title=units, height=345,
+                      margin=dict(l=15, r=15, t=48, b=15), hovermode="x unified")
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def api_key():
     try:
         key = st.secrets.get("FRED_API_KEY", "")
@@ -130,7 +195,7 @@ for container, (label, column, unit, scale) in zip(cols, metric_specs):
     container.metric(label, value_text, delta=delta_text, delta_color="off")
     container.caption(f"As of {last_date:%d %b %Y}")
 
-rates_tab, fx_tab, analytics_tab, data_tab = st.tabs(["Rates", "FX", "Analytics", "Data & Methodology"])
+rates_tab, fx_tab, analytics_tab, fomc_tab, data_tab = st.tabs(["Rates", "FX", "Analytics", "FOMC Event Study", "Data & Methodology"])
 
 with rates_tab:
     line_chart(df, ["US 2Y Treasury Yield", "US 10Y Treasury Yield"], "US Treasury Yields", "%")
@@ -167,6 +232,74 @@ with analytics_tab:
         st.caption("Descriptive historical correlation. It does not establish causation or a profitable trading strategy.")
     else:
         st.warning("Choose a longer date range for correlation analysis.")
+
+
+with fomc_tab:
+    st.subheader("FOMC announcement event study")
+    st.write("Compare selected US Treasury and USD/SGD observations around scheduled Federal Reserve policy announcements.")
+    eligible = [x for x in FOMC_DATES if pd.Timestamp(x).date() <= date.today()]
+    selected = st.selectbox("Announcement date (US Eastern calendar date)",
+                            list(reversed(eligible)),
+                            format_func=lambda d: pd.Timestamp(d).strftime("%d %b %Y"))
+    event_day = pd.Timestamp(selected)
+    st.caption("The event study fetches its own date window. The main dashboard's sidebar date range does not affect it.")
+    st.markdown(f"[Official Federal Reserve meeting calendar]({FOMC_CALENDAR_URL})")
+
+    # Two calendar weeks before and three weeks after the announcement provide
+    # a baseline and at least five post-event business sessions in normal circumstances.
+    event_start = (event_day - pd.Timedelta(days=21)).date().isoformat()
+    event_end = min((event_day + pd.Timedelta(days=21)).date(), date.today()).isoformat()
+    event_columns = {
+        "US 2Y Treasury Yield": "DGS2",
+        "US 10Y Treasury Yield": "DGS10",
+        "USD/SGD": "DEXSIUS",
+    }
+    try:
+        with st.spinner("Loading announcement-window market data..."):
+            event_data = {name: fetch_series(code, event_start, event_end, key)
+                          for name, code in event_columns.items()}
+    except (requests.RequestException, ValueError) as exc:
+        st.error(f"Could not load FOMC event-window data: {exc}")
+    else:
+        configs = [
+            ("US 2Y Treasury Yield", 100.0, "bp"),
+            ("US 10Y Treasury Yield", 100.0, "bp"),
+            ("USD/SGD", 0.0, "%"),
+        ]
+        columns = st.columns(3)
+        rows = []
+        for panel, (name, multiplier, unit) in zip(columns, configs):
+            result, error = event_reaction(event_data[name], event_day, multiplier)
+            if error:
+                panel.warning(f"{name}: {error}")
+                continue
+            readings = result["rows"]
+            panel.metric(name + " | event day", f"{readings[0]['Change']:+.2f} {unit}")
+            panel.caption(f"Baseline {result['baseline_date'].date():%d %b %Y}; event observation {readings[0]['Observation date']}")
+            for reading in readings:
+                rows.append({"Instrument": name, "Horizon": reading["Horizon"],
+                             "Observation date": reading["Observation date"],
+                             "Baseline date": result["baseline_date"].date().isoformat(),
+                             "Change": round(reading["Change"], 4), "Unit": unit})
+        if rows:
+            st.subheader("Event-window changes relative to pre-announcement baseline")
+            table = pd.DataFrame(rows)
+            st.dataframe(table, hide_index=True, use_container_width=True)
+            st.download_button("Download event study (CSV)", table.to_csv(index=False),
+                               f"fomc_event_{selected}.csv", "text/csv")
+            a, b = st.columns(2)
+            with a:
+                event_chart(event_data["US 2Y Treasury Yield"], event_day, "2Y Treasury yield change", 100.0, "bp from baseline")
+                event_chart(event_data["US 10Y Treasury Yield"], event_day, "10Y Treasury yield change", 100.0, "bp from baseline")
+            with b:
+                event_chart(event_data["USD/SGD"], event_day, "USD/SGD percentage change", 0.0, "% from baseline")
+        st.info("Method: Baseline is the last available observation strictly before the announcement. "
+                "Event day is the observation dated the announcement day; +1 and +5 sessions are subsequent valid "
+                "observations in each series. Yield changes are in bp; FX changes are percentage changes. "
+                "Daily data cannot isolate the immediate reaction to the announcement. Moves may reflect other "
+                "news, trading-session timing, or broader macroeconomic conditions. Different series may have "
+                "different observation timestamps. These are historical associations, not causal estimates.")
+
 
 with data_tab:
     st.subheader("Latest observations and downloadable data")
