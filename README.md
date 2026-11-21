@@ -1,144 +1,111 @@
 # FICC Market Analytics Dashboard
 
-An interactive financial market dashboard built using Python and Streamlit to analyse US Treasury yields, yield curve dynamics, USD/SGD exchange rates, and Federal Reserve monetary policy.
+**Interactive research dashboard for US Treasury rates, yield-curve dynamics, USD/SGD and Federal Reserve policy events.**
 
-The project explores relationships between fixed income markets, foreign exchange movements, and macroeconomic conditions through historical market data and quantitative analysis.
+[Live dashboard](https://ficc-market-dashboard.streamlit.app) | [GitHub repository](https://github.com/owingreich/ficc-market-dashboard)
 
-## Project Overview
+## Overview
 
-Fixed Income, Currencies and Commodities (FICC) markets are closely linked through interest rate expectations, monetary policy decisions, and changing macroeconomic conditions.
+This project uses Python and Streamlit to explore historical relationships across interest rates, foreign exchange and monetary-policy events. It combines market-monitoring charts, FOMC event windows, yield-curve classifications and a rule-based 2s10s strategy research module. Its primary emphasis is transparent, reproducible exploratory analysis, including the limitations of testing trading ideas with end-of-day economic data.
 
-This dashboard provides a consolidated interface for examining these relationships, with an initial focus on US interest rates and the USD/SGD currency pair.
+## Features
 
-The project focuses on three areas:
+| Module | Functionality |
+| --- | --- |
+| Rates | US 2-year and 10-year Treasury yields, 2s10s spread and Federal funds target-range upper limit |
+| FX | Historical USD/SGD observations and interactive charts |
+| Analytics | Rolling 20-observation volatility of 10Y yield changes and USD/SGD returns; recent cross-asset correlation |
+| FOMC Event Study | Selected scheduled announcement dates, pre-event baselines, event-day and subsequent-session changes, charts and CSV export |
+| Yield Curve Analysis | Flat, inverted and upward-sloping regimes; bull/bear steepening and flattening using configurable thresholds |
+| Strategy Research | Mean-reversion and momentum spread hypotheses, chronological training/holdout comparison, parameter search, performance and risk diagnostics |
+| Data & Methodology | Historical observation table, sources and CSV exports |
 
-- **Market monitoring:** Tracking Treasury yields, yield curve spreads, exchange rates, and policy interest rates.
-- **Quantitative analysis:** Examining historical market volatility, daily price and yield changes, and cross-asset correlations.
-- **Financial interpretation:** Understanding how movements in interest rates and currencies relate to broader macroeconomic developments.
+## Historical data
 
-## Key Features
+The application retrieves observations via the Federal Reserve Bank of St. Louis [FRED API](https://fred.stlouisfed.org/docs/api/fred/).
 
-### 1. US Treasury Market Analysis
+| Series | Description |
+| --- | --- |
+| [DGS2](https://fred.stlouisfed.org/series/DGS2) | 2-year US Treasury constant-maturity yield, % |
+| [DGS10](https://fred.stlouisfed.org/series/DGS10) | 10-year US Treasury constant-maturity yield, % |
+| [DEXSIUS](https://fred.stlouisfed.org/series/DEXSIUS) | Singapore dollars per US dollar |
+| [DFEDTARU](https://fred.stlouisfed.org/series/DFEDTARU) | Federal funds target-range upper limit, % |
 
-- Historical 2-year and 10-year US Treasury yields.
-- Interactive yield charts with adjustable date ranges.
-- Daily yield changes measured in basis points.
-- 2s10s Treasury yield spread analysis.
-- Federal Reserve target interest rate tracking.
+Data frequencies, publication lags, missing observations and quote conventions vary by series. Charts label historical data and should not be treated as live executable prices.
 
-### 2. Foreign Exchange Analysis
+## Quantitative methodology
 
-- Historical USD/SGD exchange rates.
-- Interactive exchange rate visualisations.
-- Daily percentage return calculations.
-- Historical foreign exchange volatility.
+### Rates and cross-asset statistics
 
-### 3. Quantitative Market Analytics
+- **2s10s spread (bp)** = `(10Y yield (%) - 2Y yield (%)) × 100`.
+- **Daily yield change (bp)** = `(yield_t - yield_(t-1)) × 100` on consecutive valid observations.
+- **USD/SGD return (%)** = `(FX_t / FX_(t-1) - 1) × 100`.
+- **Rolling volatility** = sample standard deviation of the previous 20 valid daily changes or returns, not annualised.
+- **Cross-asset correlation** = Pearson correlation using up to 60 recent shared-date observations of 10Y yield changes and USD/SGD returns.
 
-- 20-observation rolling volatility for Treasury yield changes and FX returns.
-- Historical correlation between US 10-year Treasury yield changes and USD/SGD returns.
-- Date-aligned historical observations.
-- Descriptive analysis of cross-asset market movements.
+### FOMC event windows
 
-### 4. Data Exploration
+For selected scheduled FOMC announcement dates, the reference value is the last available observation before the event. Changes are reported on the event date and after one and five subsequent available observations. These are **daily event-window associations**, not estimates of the immediate intraday announcement effect or causality. The selected event list is coded from the [Federal Reserve meeting calendar](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm).
 
-- User-defined historical analysis periods.
-- Cached data retrieval from the FRED API.
-- Historical observation tables.
-- CSV export for further financial analysis.
+### Yield-curve regimes
 
-## Technology Stack
+The curve's level is classified by whether the 2s10s spread is positive, negative or within a configurable near-flat band. Movements are described as bull/bear steepening or flattening, based on the direction of the average 2Y/10Y yield change and the change in the spread. Movements smaller than the selected tolerance remain unclassified.
 
-| Component | Technology |
-|---|---|
-| Programming Language | Python |
-| Application Framework | Streamlit |
-| Data Processing | pandas, NumPy |
-| Data Visualisation | Plotly |
-| Market Data | Federal Reserve Economic Data (FRED) |
-| Version Control | GitHub |
-| Deployment | Streamlit Community Cloud |
+### Strategy research
 
-## Data Sources
+The research hypothesis examines whether unusually large deviations in the 2s10s spread from its recent mean are followed by reversal. A matched momentum comparator takes the opposite directional position on the same eligible signals.
 
-Historical financial market data are retrieved through the Federal Reserve Bank of St. Louis FRED API.
+1. Compute a z-score at observation `t` against a rolling mean and standard deviation from **prior observations only**.
+2. Enter a hypothetical long-spread position at the next paired observation if the z-score is below the negative threshold; enter short-spread if it is above the positive threshold. Momentum reverses the direction.
+3. Exit after a configurable number of subsequent paired observations. Positions do not overlap.
+4. Score each result as `direction × (exit spread - entry spread) - hypothetical round-trip cost`, all in **spread-proxy basis points**.
+5. Split observations chronologically. Training trades must exit before the cutoff; holdout trades must enter on or after it. Trades crossing the boundary are excluded.
+6. Optionally select parameters from a predefined 27-combination grid using training mean net proxy, then display the separate holdout evaluation.
 
-| Market Indicator | FRED Series |
-|---|---|
-| US 2-Year Treasury Yield | DGS2 |
-| US 10-Year Treasury Yield | DGS10 |
-| USD/SGD Exchange Rate | DEXSIUS |
-| Federal Funds Target Range Upper Limit | DFEDTARU |
+Reported statistics include positive-trade rate, mean and aggregate spread proxy, proxy drawdown, profit factor, win/loss averages, annual outcomes, a training-only parameter sensitivity heatmap, trade ledger and CSV exports.
 
-Data are subject to the publication schedules, observation frequencies, and availability constraints of their respective sources.
+## Example research finding
 
-## Quantitative Methodology
+In an exploratory analysis of January 2018 to November 2026 using a 60-observation lookback, 1.5 z-score threshold, five-session holding period, 1 bp assumed proxy cost and a 70% chronological training split, the mean-reversion hypothesis produced a negative training aggregate but a modest positive holdout aggregate. This divergence illustrates sensitivity to market regime and sample selection; it **does not demonstrate a reliable trading edge**. Results depend on the selected dates, data availability and parameters and should be rechecked against the running app.
 
-**2s10s Yield Spread**
+## Technology
 
-The difference between 10-year and 2-year US Treasury yields, expressed in basis points:
+Python, Streamlit, pandas, NumPy, Plotly, Requests, FRED API and GitHub. Deployment uses Streamlit Community Cloud.
 
-2s10s Spread = (10Y Yield - 2Y Yield) × 100
+## Run locally
 
-**Daily Treasury Yield Changes**
-
-Calculated as the difference between consecutive available yield observations, expressed in basis points.
-
-**Foreign Exchange Returns**
-
-Calculated using the percentage change between consecutive available exchange rate observations.
-
-**Rolling Volatility**
-
-Measured using the standard deviation of daily yield changes or FX returns over a rolling 20-observation window.
-
-**Cross-Asset Correlation**
-
-Measured using Pearson correlation between US 10-year Treasury yield changes and USD/SGD daily returns, using up to the most recent 60 aligned observations.
-
-These metrics provide descriptive insights into historical market behaviour and should not be interpreted as standalone predictive trading signals.
-
-## Running Locally
-
-**Requirements:** Python 3.12+ and a FRED API key.
-
-Install dependencies:
+Requires Python 3.12+ and a free FRED API key.
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Configure the FRED API key in `.streamlit/secrets.toml`:
+Create `.streamlit/secrets.toml` in your local working directory:
 
 ```toml
-FRED_API_KEY = "your_api_key"
+FRED_API_KEY = "YOUR_FRED_API_KEY"
 ```
 
-Launch the application:
+**Never commit `secrets.toml` or disclose your API key.** Launch the app:
 
 ```bash
 python -m streamlit run app.py
 ```
 
+For Streamlit Community Cloud, configure `FRED_API_KEY` in the app's Secrets settings.
+
 ## Limitations
 
-- The dashboard uses historical observations rather than real-time market data.
-- Market holidays, publication delays, and differences in reporting frequency affect data availability.
-- Historical correlations do not establish causal relationships or predictive trading performance.
-- The analysis currently focuses on selected US interest rate and USD/SGD indicators rather than the full FICC market universe.
-
-## Future Development
-
-Planned extensions include:
-
-- FOMC announcement event studies.
-- Historical market reaction analysis around monetary policy decisions.
-- Rule-based trading hypothesis testing.
-- Additional risk metrics and market scenario analysis.
-- Expanded cross-asset coverage.
+- FRED observations are historical reference series, with differing release times and possible revisions. Signals based on the observation at `t` might not have been actionable at that point in live trading.
+- Hypothetical entry at the `t+1` published observation is not a verified executable price.
+- **Spread-proxy basis points are not bond or futures returns, dollars, DV01-neutral curve-trade P&L, or capital-weighted performance.** Instrument pricing, hedge ratios, financing, realistic execution and risk limits are outside the model.
+- The round-trip cost is a user-defined sensitivity assumption expressed in proxy bp, not a measured trading cost.
+- The chronological holdout is exploratory historical validation, not untouched external testing, especially once results have been viewed during development. Parameter searches can overfit training history.
+- Correlation and event-window moves do not establish causation.
+- The app focuses on selected fixed-income and FX indicators; it does not cover the full commodities universe.
 
 ## Disclaimer
 
-This project is intended for financial market research, quantitative analysis, and educational purposes. It does not constitute investment advice or a recommendation to trade financial instruments.
-
-Market data are attributed to their respective providers through FRED and remain subject to applicable usage and redistribution terms.
+For education and market research only. The dashboard does not provide financial advice, investment recommendations or evidence of an implementable trading strategy. Data remain subject to the providers' terms and attribution requirements.
