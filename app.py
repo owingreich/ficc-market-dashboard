@@ -111,6 +111,64 @@ def classify_curve_move(curve: pd.DataFrame, min_move_bp: float) -> pd.DataFrame
     return out
 
 
+def backtest_spread_reversion(spread: pd.Series, lookback: int = 60,
+                               entry_z: float = 1.5, holding: int = 5,
+                               cost_bp: float = 0.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Non-overlapping spread mean-reversion signal study, using observed sessions.
+
+    At the close of observation t, signal uses spread[t] and the prior `lookback`
+    observations only (rolling mean/std shifted by one observation). We assume
+    entry at the observed spread at t and exit at t+holding. This is an IDEALIZED
+    close-to-close scenario, not a fillable execution model; there may be a delay
+    between FRED observation availability and actual execution.
+    """
+    x = spread.dropna().sort_index().astype(float)
+    history = x.shift(1)
+    mean = history.rolling(lookback, min_periods=lookback).mean()
+    std = history.rolling(lookback, min_periods=lookback).std(ddof=1)
+    z = ((x - mean) / std.where(std > 1e-12)).replace([float('inf'), -float('inf')], float('nan'))
+    observations = pd.DataFrame({"spread_bp": x, "reference_mean_bp": mean,
+                                 "reference_std_bp": std, "z_score": z})
+    observations["signal"] = 0
+    observations.loc[observations["z_score"] >= entry_z, "signal"] = -1  # short spread
+    observations.loc[observations["z_score"] <= -entry_z, "signal"] = 1   # long spread
+    observations["signal_label"] = observations["signal"].map(
+        {-1: "Short spread", 0: "No trade", 1: "Long spread"})
+
+    # One position at a time. Entries at next possible decision occur strictly
+    # after prior exit, so neither holding periods nor observations overlap.
+    trades = []
+    i = lookback
+    while i < len(observations) - holding:
+        row = observations.iloc[i]
+        direction = int(row["signal"])
+        if direction == 0:
+            i += 1
+            continue
+        exit_i = i + holding
+        exit_row = observations.iloc[exit_i]
+        spread_change = float(exit_row["spread_bp"] - row["spread_bp"])
+        gross = direction * spread_change
+        net = gross - cost_bp
+        trades.append({
+            "entry_date": observations.index[i].date().isoformat(),
+            "exit_date": observations.index[exit_i].date().isoformat(),
+            "position": "Long spread" if direction > 0 else "Short spread",
+            "entry_spread_bp": round(float(row["spread_bp"]), 4),
+            "entry_z_score": round(float(row["z_score"]), 4),
+            "exit_spread_bp": round(float(exit_row["spread_bp"]), 4),
+            "spread_change_bp": round(spread_change, 4),
+            "gross_proxy_bp": round(gross, 4),
+            "assumed_cost_bp": round(cost_bp, 4),
+            "net_proxy_bp": round(net, 4),
+        })
+        i = exit_i + 1
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty:
+        trades_df["cumulative_net_proxy_bp"] = trades_df["net_proxy_bp"].cumsum()
+    return observations, trades_df
+
+
 def api_key():
     try:
         key = st.secrets.get("FRED_API_KEY", "")
@@ -226,8 +284,9 @@ for container, (label, column, unit, scale) in zip(cols, metric_specs):
     container.metric(label, value_text, delta=delta_text, delta_color="off")
     container.caption(f"As of {last_date:%d %b %Y}")
 
-rates_tab, fx_tab, analytics_tab, fomc_tab, curve_tab, data_tab = st.tabs([
-    "Rates", "FX", "Analytics", "FOMC Event Study", "Yield Curve Analysis", "Data & Methodology"
+rates_tab, fx_tab, analytics_tab, fomc_tab, curve_tab, backtest_tab, data_tab = st.tabs([
+    "Rates", "FX", "Analytics", "FOMC Event Study", "Yield Curve Analysis",
+    "Strategy Research", "Data & Methodology"
 ])
 
 with rates_tab:
@@ -419,6 +478,132 @@ with curve_tab:
                 "and risk limits. Bull/bear classifications here use the sign of the average of "
                 "2Y and 10Y yield changes, with a configurable tolerance. They are descriptive "
                 "labels, not trading recommendations or backtested returns.")
+
+
+with backtest_tab:
+    st.subheader("Strategy research: 2s10s spread mean reversion")
+    st.write("Hypothesis: unusually wide 2s10s spreads tend to narrow, and unusually "
+             "narrow spreads tend to widen, over the following trading sessions.")
+    st.caption("Research-only signal study. Results are an idealized spread-change proxy "
+               "in bp, NOT actual tradable bond or futures P&L.")
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        lookback = st.slider("Prior observations", 20, 120, 60, step=10,
+                             help="Rolling mean/std use only sessions preceding the signal date.")
+    with col_b:
+        threshold = st.slider("Entry z-score (absolute)", 0.5, 3.0, 1.5, step=0.25,
+                              help="At least this many prior-window standard deviations from its mean.")
+    with col_c:
+        holding = st.slider("Holding period (sessions)", 1, 20, 5,
+                            help="Exit after this many paired Treasury observation sessions.")
+    with col_d:
+        cost = st.number_input("Hypothetical round-trip cost (bp)", min_value=0.0,
+                               max_value=10.0, value=0.0, step=0.5,
+                               help="A sensitivity assumption in spread-proxy bp, not observed transaction costs.")
+
+    spread = df[["US 2Y Treasury Yield", "US 10Y Treasury Yield"]].dropna()
+    spread = (spread["US 10Y Treasury Yield"] - spread["US 2Y Treasury Yield"]) * 100
+    spread.name = "2s10s spread (bp)"
+    if len(spread) < lookback + holding + 2:
+        st.warning("Insufficient paired Treasury observations. Widen the sidebar date range "
+                   "or reduce the lookback and holding period.")
+    else:
+        observations, trades = backtest_spread_reversion(spread, lookback, threshold, holding, cost)
+        signal_count = int((observations["signal"] != 0).sum())
+        st.caption(f"{len(spread):,} paired Treasury observations | {signal_count} raw threshold "
+                   "crossings (before excluding overlapping positions) | "
+                   "one position at a time")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=observations.index, y=observations["spread_bp"],
+                                 name="2s10s spread", mode="lines"))
+        fig.add_trace(go.Scatter(x=observations.index, y=observations["reference_mean_bp"],
+                                 name="Prior-window mean", mode="lines", line=dict(dash="dash")))
+        if not trades.empty:
+            entry_index = pd.to_datetime(trades["entry_date"])
+            longs = trades["position"] == "Long spread"
+            for mask, label, symbol in [
+                (longs, "Long spread entries", "triangle-up"),
+                (~longs, "Short spread entries", "triangle-down"),
+            ]:
+                if mask.any():
+                    dates = entry_index[mask]
+                    fig.add_trace(go.Scatter(x=dates, y=observations.loc[dates, "spread_bp"],
+                                             mode="markers", name=label,
+                                             marker=dict(size=10, symbol=symbol)))
+        fig.update_layout(title="Spread and historical entry signals", height=420,
+                          yaxis_title="basis points", hovermode="x unified",
+                          margin=dict(l=15, r=15, t=55, b=15))
+        st.plotly_chart(fig, use_container_width=True)
+
+        if trades.empty:
+            st.info("No completed non-overlapping trades under these settings. Try a longer "
+                    "historical period or a lower entry threshold. A zero-trade result is valid.")
+        else:
+            wins = float((trades["net_proxy_bp"] > 0).mean() * 100)
+            avg = float(trades["net_proxy_bp"].mean())
+            cumulative = float(trades["net_proxy_bp"].sum())
+            worst = float(trades["net_proxy_bp"].min())
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Completed trades", str(len(trades)))
+            m2.metric("Net positive-trade rate", f"{wins:.1f}%")
+            m3.metric("Mean net proxy / trade", f"{avg:+.2f} bp")
+            m4.metric("Total net proxy", f"{cumulative:+.2f} bp")
+            st.caption(f"Worst single-trade net proxy: {worst:+.2f} bp. "
+                       "A positive-trade rate above 50% alone does not demonstrate statistical "
+                       "significance or implementable profitability.")
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=pd.to_datetime(trades["exit_date"]),
+                                      y=trades["cumulative_net_proxy_bp"],
+                                      mode="lines+markers", name="Cumulative trade proxy"))
+            fig2.add_hline(y=0, line_dash="dot", line_color="gray")
+            fig2.update_layout(title="Cumulative signed spread-change proxy (completed trades only)",
+                               yaxis_title="cumulative proxy bp", height=360,
+                               margin=dict(l=15, r=15, t=55, b=15))
+            st.plotly_chart(fig2, use_container_width=True)
+            st.subheader("Trade ledger")
+            st.dataframe(trades.sort_values("entry_date", ascending=False),
+                         use_container_width=True, hide_index=True)
+            st.download_button("Download research trade ledger (CSV)",
+                               trades.to_csv(index=False),
+                               "ficc_curve_reversion_research.csv", mime="text/csv")
+            midpoint = len(trades) // 2
+            if len(trades) >= 8:
+                earlier = trades.iloc[:midpoint]
+                later = trades.iloc[midpoint:]
+                st.markdown("**Chronological split (descriptive robustness check)**")
+                summary = pd.DataFrame([
+                    {"Sample": name, "Trades": len(part),
+                     "Mean net proxy (bp)": round(float(part["net_proxy_bp"].mean()), 2),
+                     "Positive trade rate (%)": round(float((part["net_proxy_bp"] > 0).mean() * 100), 1)}
+                    for name, part in [("Earlier half", earlier), ("Later half", later)]
+                ])
+                st.dataframe(summary, hide_index=True, use_container_width=True)
+                st.caption("This split does not create a true untouched out-of-sample test if "
+                           "you repeatedly adjust parameters while viewing the later sample.")
+
+        with st.expander("Research methodology and limitations", expanded=True):
+            st.markdown("""
+            **Signal timing:** At each completed Treasury observation session *t*, compute a
+            z-score using the **previous** `lookback` paired observations only. If the current
+            spread is above the prior mean by at least the z threshold, enter a hypothetical
+            **short-spread** position; below the mean, enter a hypothetical **long-spread** position.
+
+            **Exit and scoring:** Hold for the selected number of subsequent paired observation
+            sessions. Long-spread proxy = exit spread minus entry spread; short-spread proxy
+            = entry spread minus exit spread. Subtract the optional, hypothetical round-trip
+            cost once per completed trade. Exit sessions are excluded from immediate re-entry;
+            positions never overlap. The final incomplete holding period is omitted.
+
+            **What this does *not* establish:** FRED observations may be published after the
+            relevant market close, so assumed entry at the observed value may be unavailable
+            in live trading. Spread bp are **not** price returns, cash P&L, or a DV01-neutral
+            replication. Actual curve trades require instrument-level prices, durations,
+            financing, execution assumptions, slippage, and transaction costs. Repeated
+            parameter selection can overfit historical data. The sample excludes data
+            before the sidebar start date, and no significance test is performed.
+            """)
 
 
 with data_tab:
